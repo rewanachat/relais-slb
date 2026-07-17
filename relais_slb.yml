@@ -1,0 +1,81 @@
+# relais_slb.yml — Relais HTTPS du fichier SLB IBKR (Phase 0 du plan v2)
+# ==============================================================================
+# POURQUOI : le port 21 (FTP) est bloqué par la box ET étranglé par l'opérateur
+# mobile côté machine locale. Les runners GitHub, eux, sortent librement en FTP.
+# Ce workflow tire usa.txt depuis IBKR toutes les 2 h (jours ouvrés) et le
+# committe dans le dépôt. Résultats :
+#   1. Le fichier devient accessible en HTTPS :
+#      https://raw.githubusercontent.com/<user>/<repo>/main/usa.txt
+#   2. La collecte tourne MÊME PC ÉTEINT.
+#   3. L'historique git archive CHAQUE version du fichier — sauvegarde
+#      hors-site gratuite d'un flux qui n'a aucun historique officiel.
+#      (Ordre de grandeur : ~6 versions/jour ouvré ; avec la compression
+#      delta de git sur du texte pipe, comptez grossièrement quelques
+#      centaines de Mo/an — surveiller la taille du dépôt à 12 mois.)
+#
+# INSTALLATION (une fois) :
+#   1. Créer un dépôt GitHub dédié (privé ou public), ex. « slb-relay ».
+#   2. Y placer ce fichier sous .github/workflows/relais_slb.yml et pousser.
+#   3. Onglet Actions -> activer les workflows -> « Run workflow » pour le
+#      premier passage manuel.
+#   4. Sur la machine locale :
+#      python collecte_slb.py --miroir https://raw.githubusercontent.com/<user>/slb-relay/main/{pays}.txt
+#      (ou définir SLB_MIROIR une fois pour toutes :
+#       setx SLB_MIROIR "https://raw.githubusercontent.com/<user>/slb-relay/main/{pays}.txt")
+#
+# NOTE cron : GitHub Actions est en UTC et la planification est best-effort
+# (dérive de quelques minutes possible — sans importance, le dédoublonnage
+# #BOF côté collecteur local absorbe tout).
+
+name: relais-slb-ibkr
+
+on:
+  schedule:
+    # Toutes les 2 h, 12h00–22h00 UTC, lundi-vendredi (couvre la séance US
+    # 9h30–16h00 ET été comme hiver, avec un passage pré-ouverture).
+    - cron: "0 12,14,16,18,20,22 * * 1-5"
+  workflow_dispatch: {}   # déclenchement manuel pour tester
+
+permissions:
+  contents: write
+
+concurrency:
+  group: relais-slb
+  cancel-in-progress: false
+
+jobs:
+  relayer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tirer usa.txt depuis le FTP IBKR
+        run: |
+          set -e
+          curl -sS --connect-timeout 30 --max-time 180 \
+            "ftp://shortstock:@ftp3.interactivebrokers.com/usa.txt" \
+            -o usa_nouveau.txt
+          # Garde-fous : contenu non vide, commence par #BOF, finit par #EOF
+          test -s usa_nouveau.txt
+          head -c 4 usa_nouveau.txt | grep -q "#BOF"
+          tail -3 usa_nouveau.txt | grep -q "#EOF"
+          echo "Fichier valide : $(wc -l < usa_nouveau.txt) lignes,"
+          echo "BOF : $(head -1 usa_nouveau.txt)"
+
+      - name: Committer si le fichier a changé (dédoublonnage par #BOF)
+        run: |
+          set -e
+          BOF_NOUVEAU=$(head -1 usa_nouveau.txt)
+          BOF_ACTUEL=$(head -1 usa.txt 2>/dev/null || echo "aucun")
+          if [ "$BOF_NOUVEAU" = "$BOF_ACTUEL" ]; then
+            echo "IBKR n'a pas rafraîchi ($BOF_ACTUEL) — pas de commit."
+            exit 0
+          fi
+          mv usa_nouveau.txt usa.txt
+          git config user.name  "relais-slb[bot]"
+          git config user.email "relais-slb@users.noreply.github.com"
+          git add usa.txt
+          git commit -m "SLB usa.txt — ${BOF_NOUVEAU}"
+          git push
